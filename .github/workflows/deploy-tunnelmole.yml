@@ -1,0 +1,231 @@
+name: Deploy - Tunnelmole (Public Access, No Auth Required)
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_duration:
+        description: "How long to keep the app running (seconds, max 3600)"
+        required: false
+        default: "3600"
+
+jobs:
+  deploy:
+    name: Deploy with Tunnelmole
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -f Dockerfile.api -t moneyprinterturbo:latest .
+          echo "Docker image built successfully"
+
+      - name: Start application container
+        run: |
+          docker run -d \
+            --name mpt-app \
+            -p 127.0.0.1:8080:8080 \
+            -v $(pwd)/storage:/app/storage \
+            --health-cmd='curl -f http://localhost:8080/docs || exit 1' \
+            --health-interval=10s \
+            --health-timeout=5s \
+            --health-retries=3 \
+            --health-start-period=15s \
+            moneyprinterturbo:latest
+          echo "Container started"
+
+      - name: Wait for application to be ready
+        timeout-minutes: 2
+        run: |
+          bash .github/scripts/verify_startup.sh 8080 60 /docs
+          if [ $? -ne 0 ]; then
+            echo "=== Docker logs ==="
+            docker logs mpt-app
+            exit 1
+          fi
+
+      - name: Install and setup Tunnelmole
+        run: |
+          # Install Tunnelmole
+          curl -s https://install.tunnelmole.com/install.sh | bash
+          
+          # Verify installation
+          which tm || exit 1
+          echo "Tunnelmole installed successfully"
+
+      - name: Start Tunnelmole tunnel in background
+        run: |
+          # Start the tunnel
+          nohup tm localhost:8080 --verbose > tunnelmole.log 2>&1 &
+          echo $! > tunnelmole.pid
+          
+          # Give it time to initialize
+          sleep 5
+          
+          if ! kill -0 $(cat tunnelmole.pid) 2>/dev/null; then
+            echo "Failed to start Tunnelmole:"
+            cat tunnelmole.log
+            exit 1
+          fi
+          
+          echo "Tunnelmole tunnel started (PID: $(cat tunnelmole.pid))"
+
+      - name: Extract Tunnelmole public URL
+        timeout-minutes: 2
+        run: |
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          PUBLIC_URL=""
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            # Try to extract URL from logs
+            PUBLIC_URL=$(grep -o 'https://[a-zA-Z0-9]*\.tunnelmole\.com' tunnelmole.log 2>/dev/null | head -1)
+            
+            if [ -n "$PUBLIC_URL" ]; then
+              echo "PUBLIC_URL=$PUBLIC_URL" >> $GITHUB_ENV
+              echo "Successfully obtained public URL: $PUBLIC_URL"
+              break
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            if [ $((ATTEMPT % 10)) -eq 0 ]; then
+              echo "Waiting for Tunnelmole to be ready... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+            fi
+            sleep 1
+          done
+          
+          if [ -z "$PUBLIC_URL" ]; then
+            echo "ERROR: Could not obtain public URL from Tunnelmole"
+            echo "=== Tunnelmole logs ==="
+            cat tunnelmole.log
+            echo "=== Tunnelmole process info ==="
+            ps aux | grep tm || echo "Tunnelmole process not found"
+            exit 1
+          fi
+
+      - name: Verify public access
+        timeout-minutes: 2
+        run: |
+          PUBLIC_URL="${{ env.PUBLIC_URL }}"
+          echo "Testing public URL: $PUBLIC_URL"
+          
+          # Wait a bit more for tunnel to stabilize
+          sleep 3
+          
+          # Try multiple times as Tunnelmole may take a moment
+          MAX_RETRIES=10
+          for i in $(seq 1 $MAX_RETRIES); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/docs" 2>/dev/null || echo "000")
+            
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ]; then
+              echo "✓ Public access verified (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Attempt $i/$MAX_RETRIES: HTTP $HTTP_CODE, retrying in 3 seconds..."
+              sleep 3
+            fi
+          done
+          
+          echo "Warning: Could not verify access after $MAX_RETRIES attempts (HTTP $HTTP_CODE)"
+          # Don't fail here, tunnel might still work
+
+      - name: Print deployment information
+        run: |
+          PUBLIC_URL="${{ env.PUBLIC_URL }}"
+          
+          echo "=== DEPLOYMENT SUCCESSFUL ===" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Application Type:** FastAPI REST API with Tunnelmole" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**🌐 PUBLIC ACCESS URL:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "$PUBLIC_URL" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**API Endpoints:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **Swagger UI:** $PUBLIC_URL/docs" >> $GITHUB_STEP_SUMMARY
+          echo "- **ReDoc:** $PUBLIC_URL/redoc" >> $GITHUB_STEP_SUMMARY
+          echo "- **OpenAPI Schema:** $PUBLIC_URL/openapi.json" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**⏱️ Duration:** ${{ inputs.deployment_duration }} seconds (max 3600)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**✨ Advantages:**" >> $GITHUB_STEP_SUMMARY
+          echo "- No authentication token required" >> $GITHUB_STEP_SUMMARY
+          echo "- Free tier available" >> $GITHUB_STEP_SUMMARY
+          echo "- Simple setup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**⚠️ Limitations:**" >> $GITHUB_STEP_SUMMARY
+          echo "- URL is temporary and expires when the job ends" >> $GITHUB_STEP_SUMMARY
+          echo "- May have rate limiting on free plan" >> $GITHUB_STEP_SUMMARY
+          echo "- Data persistence: None (ephemeral deployment)" >> $GITHUB_STEP_SUMMARY
+          echo "- Less stable than paid services" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Port:** 8080 (FastAPI)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Keep deployment alive
+        timeout-minutes: 120
+        continue-on-error: true
+        run: |
+          DURATION=${{ inputs.deployment_duration }}
+          if [ -z "$DURATION" ] || [ "$DURATION" -le 0 ]; then
+            DURATION=3600
+          fi
+          
+          # Cap at 1 hour for safety
+          if [ "$DURATION" -gt 3600 ]; then
+            DURATION=3600
+          fi
+          
+          echo "Keeping deployment alive for ${DURATION} seconds..."
+          for i in $(seq 1 $((DURATION / 10))); do
+            sleep 10
+            REMAINING=$((DURATION - i * 10))
+            if [ $((i % 6)) -eq 0 ]; then
+              echo "Status: Application running, $REMAINING seconds remaining..."
+            fi
+          done
+          echo "Timeout reached"
+
+      - name: Capture logs before shutdown
+        if: always()
+        run: |
+          echo "=== Application Logs ===" >> deployment.log
+          docker logs mpt-app >> deployment.log 2>&1 || echo "Container not found" >> deployment.log
+          echo "" >> deployment.log
+          echo "=== Tunnelmole Logs ===" >> deployment.log
+          cat tunnelmole.log >> deployment.log 2>&1 || echo "Tunnelmole logs not available" >> deployment.log
+          echo "" >> deployment.log
+          echo "=== Final URL ===" >> deployment.log
+          echo "${{ env.PUBLIC_URL }}" >> deployment.log
+          cat deployment.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-logs-tunnelmole
+          path: deployment.log
+          retention-days: 3
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up..."
+          
+          # Kill Tunnelmole
+          if [ -f tunnelmole.pid ]; then
+            kill $(cat tunnelmole.pid) 2>/dev/null || true
+            wait $(cat tunnelmole.pid) 2>/dev/null || true
+          fi
+          
+          # Stop Docker container
+          docker stop mpt-app 2>/dev/null || true
+          docker rm mpt-app 2>/dev/null || true
+          
+          echo "Cleanup complete"

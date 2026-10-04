@@ -1,0 +1,235 @@
+name: Deploy - LocalTunnel (Public Access, Simple Setup)
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_duration:
+        description: "How long to keep the app running (seconds, max 3600)"
+        required: false
+        default: "3600"
+      subdomain_name:
+        description: "Optional custom subdomain (e.g. 'mpt-api'). Leave blank for random."
+        required: false
+        default: ""
+
+jobs:
+  deploy:
+    name: Deploy with LocalTunnel
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install LocalTunnel
+        run: |
+          npm install -g localtunnel
+          lt --version
+
+      - name: Build Docker image
+        run: |
+          docker build -f Dockerfile.api -t moneyprinterturbo:latest .
+          echo "Docker image built successfully"
+
+      - name: Start application container
+        run: |
+          docker run -d \
+            --name mpt-app \
+            -p 127.0.0.1:8080:8080 \
+            -v $(pwd)/storage:/app/storage \
+            --health-cmd='curl -f http://localhost:8080/docs || exit 1' \
+            --health-interval=10s \
+            --health-timeout=5s \
+            --health-retries=3 \
+            --health-start-period=15s \
+            moneyprinterturbo:latest
+          echo "Container started"
+
+      - name: Wait for application to be ready
+        timeout-minutes: 2
+        run: |
+          bash .github/scripts/verify_startup.sh 8080 60 /docs
+          if [ $? -ne 0 ]; then
+            echo "=== Docker logs ==="
+            docker logs mpt-app
+            exit 1
+          fi
+
+      - name: Start LocalTunnel in background
+        run: |
+          SUBDOMAIN_ARG=""
+          if [ -n "${{ inputs.subdomain_name }}" ]; then
+            SUBDOMAIN_ARG="--subdomain ${{ inputs.subdomain_name }}"
+          fi
+          
+          nohup lt --port 8080 $SUBDOMAIN_ARG --log-level error > localtunnel.log 2>&1 &
+          echo $! > localtunnel.pid
+          
+          sleep 5
+          
+          if ! kill -0 $(cat localtunnel.pid) 2>/dev/null; then
+            echo "Failed to start LocalTunnel:"
+            cat localtunnel.log
+            exit 1
+          fi
+          
+          echo "LocalTunnel tunnel started (PID: $(cat localtunnel.pid))"
+
+      - name: Extract LocalTunnel public URL
+        timeout-minutes: 2
+        run: |
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          PUBLIC_URL=""
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            # Try to extract URL from logs
+            PUBLIC_URL=$(grep -o 'https://[^ ]*\.loca\.lt' localtunnel.log 2>/dev/null | head -1)
+            
+            if [ -n "$PUBLIC_URL" ]; then
+              echo "PUBLIC_URL=$PUBLIC_URL" >> $GITHUB_ENV
+              echo "Successfully obtained public URL: $PUBLIC_URL"
+              break
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            if [ $((ATTEMPT % 10)) -eq 0 ]; then
+              echo "Waiting for LocalTunnel to be ready... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+            fi
+            sleep 1
+          done
+          
+          if [ -z "$PUBLIC_URL" ]; then
+            echo "ERROR: Could not obtain public URL from LocalTunnel"
+            echo "=== LocalTunnel logs ==="
+            cat localtunnel.log
+            exit 1
+          fi
+
+      - name: Verify public access
+        timeout-minutes: 2
+        run: |
+          PUBLIC_URL="${{ env.PUBLIC_URL }}"
+          echo "Testing public URL: $PUBLIC_URL"
+          
+          sleep 3
+          
+          # Try with retry
+          MAX_RETRIES=10
+          for i in $(seq 1 $MAX_RETRIES); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/docs" 2>/dev/null || echo "000")
+            
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ]; then
+              echo "✓ Public access verified (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Attempt $i/$MAX_RETRIES: HTTP $HTTP_CODE, retrying..."
+              sleep 2
+            fi
+          done
+          
+          echo "Warning: Could not verify access (HTTP $HTTP_CODE)"
+
+      - name: Print deployment information
+        run: |
+          PUBLIC_URL="${{ env.PUBLIC_URL }}"
+          
+          echo "=== DEPLOYMENT SUCCESSFUL ===" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Application Type:** FastAPI REST API with LocalTunnel" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**🌐 PUBLIC ACCESS URL:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "$PUBLIC_URL" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**API Endpoints:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **Swagger UI:** $PUBLIC_URL/docs" >> $GITHUB_STEP_SUMMARY
+          echo "- **ReDoc:** $PUBLIC_URL/redoc" >> $GITHUB_STEP_SUMMARY
+          echo "- **OpenAPI Schema:** $PUBLIC_URL/openapi.json" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**⏱️ Duration:** ${{ inputs.deployment_duration }} seconds (max 3600)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**✨ Advantages:**" >> $GITHUB_STEP_SUMMARY
+          echo "- No authentication required" >> $GITHUB_STEP_SUMMARY
+          echo "- Works with Node.js (npm install)" >> $GITHUB_STEP_SUMMARY
+          echo "- Reliable public tunnel service" >> $GITHUB_STEP_SUMMARY
+          echo "- Optional custom subdomain" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**⚠️ Limitations:**" >> $GITHUB_STEP_SUMMARY
+          echo "- URL is temporary and expires when the job ends" >> $GITHUB_STEP_SUMMARY
+          echo "- Free tier has rate limits" >> $GITHUB_STEP_SUMMARY
+          echo "- Data persistence: None (ephemeral deployment)" >> $GITHUB_STEP_SUMMARY
+          echo "- Subdomain availability not guaranteed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Port:** 8080 (FastAPI)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Keep deployment alive
+        timeout-minutes: 120
+        continue-on-error: true
+        run: |
+          DURATION=${{ inputs.deployment_duration }}
+          if [ -z "$DURATION" ] || [ "$DURATION" -le 0 ]; then
+            DURATION=3600
+          fi
+          
+          if [ "$DURATION" -gt 3600 ]; then
+            DURATION=3600
+          fi
+          
+          echo "Keeping deployment alive for ${DURATION} seconds..."
+          for i in $(seq 1 $((DURATION / 10))); do
+            sleep 10
+            REMAINING=$((DURATION - i * 10))
+            if [ $((i % 6)) -eq 0 ]; then
+              echo "Status: Application running, $REMAINING seconds remaining..."
+            fi
+          done
+          echo "Timeout reached"
+
+      - name: Capture logs before shutdown
+        if: always()
+        run: |
+          echo "=== Application Logs ===" >> deployment.log
+          docker logs mpt-app >> deployment.log 2>&1 || echo "Container not found" >> deployment.log
+          echo "" >> deployment.log
+          echo "=== LocalTunnel Logs ===" >> deployment.log
+          cat localtunnel.log >> deployment.log 2>&1 || echo "LocalTunnel logs not available" >> deployment.log
+          echo "" >> deployment.log
+          echo "=== Final URL ===" >> deployment.log
+          echo "${{ env.PUBLIC_URL }}" >> deployment.log
+          cat deployment.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-logs-localtunnel
+          path: deployment.log
+          retention-days: 3
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up..."
+          
+          # Kill LocalTunnel
+          if [ -f localtunnel.pid ]; then
+            kill $(cat localtunnel.pid) 2>/dev/null || true
+            wait $(cat localtunnel.pid) 2>/dev/null || true
+          fi
+          
+          # Stop Docker container
+          docker stop mpt-app 2>/dev/null || true
+          docker rm mpt-app 2>/dev/null || true
+          
+          echo "Cleanup complete"
