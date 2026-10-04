@@ -56,10 +56,10 @@ jobs:
       - name: Install and setup Tunnelmole
         run: |
           # Install Tunnelmole
-          curl -s https://install.tunnelmole.com/install.sh | bash
+           npm install -g tunnelmole
           
           # Verify installation
-          which tm || exit 1
+          which tmole || which tm || exit 1
           echo "Tunnelmole installed successfully"
 
       - name: Start Tunnelmole tunnel in background
