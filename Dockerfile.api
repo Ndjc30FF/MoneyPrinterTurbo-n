@@ -1,6 +1,6 @@
 # Multi-stage build: production FastAPI deployment
 # Stage 1: Builder - Install all dependencies
-FROM python:3.11-slim-bullseye AS builder
+FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -19,7 +19,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt
 
 # Stage 2: Runtime - Minimal production image
-FROM python:3.11-slim-bullseye
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
