@@ -9,8 +9,9 @@ ENV PYTHONPATH="/app" \
     PYTHONDONTWRITEBYTECODE=1
 
 # System dependencies installation
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends git ffmpeg curl && \
+RUN apt-get update --fix-missing || apt-get update && \
+    apt-get install -y --no-install-recommends git ffmpeg curl || \
+    (sleep 5 && apt-get update && apt-get install -y --no-install-recommends git ffmpeg curl) && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
@@ -29,10 +30,10 @@ ENV PYTHONPATH="/app" \
     LISTEN_PORT="8080"
 
 # Install only runtime system dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg git curl && \
+RUN apt-get update --fix-missing || apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg git curl || \
+    (sleep 5 && apt-get update && apt-get install -y --no-install-recommends ffmpeg git curl) && \
     rm -rf /var/lib/apt/lists/*
-
 # Copy Python packages from builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
